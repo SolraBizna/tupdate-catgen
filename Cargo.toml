@@ -1,0 +1,15 @@
+[package]
+name = "tupdate-catgen"
+description = "Generates catalog files for the Tejat Updater"
+version = "1.0.0"
+authors = ["Solra Bizna <solra@bizna.name>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = {version = "4.1", features = ["derive", "wrap_help"]}
+crossbeam-channel = "0.5"
+hex = "0.4"
+lsx = {version = "1.1", default-features = false, features = ["sha256"]}
+num_cpus = "1.0"
+wax = "0.5"
