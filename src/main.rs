@@ -1,8 +1,9 @@
 use std::{
+    cmp::Ord,
     path::{Path, PathBuf},
     process::ExitCode,
     fs, fs::File,
-    io, io::Read,
+    io, io::{Read, Write},
 };
 
 use crossbeam_channel as mpmc;
@@ -81,7 +82,7 @@ fn descend(scan_tx: &mut mpmc::Sender<(PathBuf, u64)>, invocation: &Invocation, 
     }
 }
 
-fn sum_file(path: &Path, meta_size: u64) -> std::io::Result<()> {
+fn sum_file(path: &Path, meta_size: u64, result_tx: &mut mpmc::Sender<(String, [u8;32], u64)>) -> std::io::Result<()> {
     let path_as_str = match path.to_str() {
         Some(x) => x,
         None => {
@@ -103,13 +104,14 @@ fn sum_file(path: &Path, meta_size: u64) -> std::io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::Other, "metadata size and file size don't match"))
     }
     let sum = hasher.finish(&[]);
-    println!("{};{};{}", path_as_str, hex::encode_upper(&sum), meta_size);
-    Ok(())
+    result_tx.send((path_as_str.to_string(), sum, meta_size)).map_err(|_| {
+        return io::Error::new(io::ErrorKind::Other, "channel closed unexpectedly")
+    })
 }
 
-fn summer(scan_rx: mpmc::Receiver<(PathBuf, u64)>) -> Result<(), ()> {
+fn summer(scan_rx: mpmc::Receiver<(PathBuf, u64)>, mut result_tx: mpmc::Sender<(String, [u8;32], u64)>) -> Result<(), ()> {
     while let Ok((path, size)) = scan_rx.recv() {
-        match sum_file(&path, size) {
+        match sum_file(&path, size, &mut result_tx) {
             Ok(_) => (),
             Err(x) => {
                 eprintln!("{:?}: {}", path, x);
@@ -122,6 +124,7 @@ fn summer(scan_rx: mpmc::Receiver<(PathBuf, u64)>) -> Result<(), ()> {
 fn main() -> ExitCode {
     let invocation = Invocation::parse();
     let (mut scan_tx, scan_rx) = mpmc::bounded(num_cpus::get() + 3);
+    let (result_tx, result_rx) = mpmc::bounded(num_cpus::get() + 3);
     let scan_thread = std::thread::Builder::new()
     .name("scan".to_string()).spawn(move || -> Result<(), ()> {
         let includes: Vec<Glob> = match invocation.include.iter().map(|src| {
@@ -149,11 +152,17 @@ fn main() -> ExitCode {
     }).unwrap();
     let summers = (1 ..= num_cpus::get()).map(|n| {
         let scan_rx = scan_rx.clone();
+        let result_tx = result_tx.clone();
         std::thread::Builder::new()
         .name(format!("summer {}", n)).spawn(move || {
-            summer(scan_rx)
+            summer(scan_rx, result_tx)
         }).unwrap()
     }).collect::<Vec<_>>();
+    drop(result_tx);
+    let mut results = vec![];
+    while let Ok(result) = result_rx.recv() {
+        results.push(result);
+    }
     for summer in summers.into_iter() {
         match summer.join() {
             Ok(Ok(())) => (),
@@ -161,7 +170,32 @@ fn main() -> ExitCode {
         }
     }
     match scan_thread.join() {
-        Ok(Ok(())) => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
+        Ok(Ok(())) => (),
+        _ => return ExitCode::FAILURE,
     }
+    results.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+    });
+    let mut output = Vec::with_capacity(results.iter().fold(0, |a,x| {
+        a + 43 + x.0.len()
+    }));
+    for result in results.iter() {
+        output.extend_from_slice(result.0.as_bytes());
+        output.push(b'\n');
+        output.extend_from_slice(&result.1);
+        output.extend_from_slice(&result.2.to_be_bytes());
+        output.extend_from_slice(&[0,0]); // for future expansion
+    }
+    if output.len() > u32::MAX as usize {
+        panic!("Catalog files cannot be longer than 4GiB before compression. (That's enough for over 50 MILLION files.)");
+    }
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(b"\xFFTCat").unwrap();
+    stdout.write_all(&lsx::sha256::hash(&output[..])).unwrap();
+    stdout.write_all(&(output.len() as u32).to_be_bytes()).unwrap();
+    let mut encoder = flate2::write::ZlibEncoder::new(&mut stdout, flate2::Compression::best());
+    encoder.write_all(&output).unwrap();
+    encoder.finish().unwrap();
+    ExitCode::SUCCESS
 }
