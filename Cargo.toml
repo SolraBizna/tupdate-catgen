@@ -5,6 +5,7 @@ version = "1.0.0"
 authors = ["Solra Bizna <solra@bizna.name>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/SolraBizna/tupdate-catgen"
 
 [dependencies]
 clap = {version = "4.1", features = ["derive", "wrap_help"]}
